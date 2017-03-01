@@ -1,0 +1,360 @@
+#ifndef SPERATEDIJK_H_
+#define SPERATEDIJK_H_
+#include <sys/types.h>
+#include <sys/stat.h>
+#include <stdlib.h>
+#include <malloc.h>
+#include <fcntl.h>
+#include <sys/mman.h>
+#include <immintrin.h>
+#include <omp.h>
+#include "../Utils/ColorUtils.h"
+
+class SeperateDijk;
+
+namespace SeperateDijkUtils {
+    class Syncer {
+        omp_lock_t lock;
+        bool *marker;
+        int counter;
+        const int N;
+
+        inline void set(int p);
+
+        inline void unset(int p);
+
+    public:
+        Syncer(int n);
+
+        inline void setSafe(int p, SeperateDijk * const solver);
+
+        inline void unsetSafe(int p);
+
+        bool ready(int p);
+
+        bool ready();
+
+        ~Syncer();
+    };
+}
+
+using Utils::OMPLockStacks;
+
+struct Node {
+  int dist;
+  int w[3];
+  int to[3];
+} __attribute__((aligned(64)));
+
+#include <climits>
+class SeperateDijk: public Solver<AdjacentMatrix> {
+
+    char name[1024];
+    const int THREAD_NUM, NUM_RELAX_EACH_ITERATION;
+    const char * SOURCE_SRC;
+    const int *colors, *label, *unlabel;
+
+    int *shortestArc;
+    SeperateDijkUtils::Syncer *syncer;
+
+    friend class SeperateDijkUtils::Syncer;
+
+  void relax(AdjacentMatrix *matrix, int &totalScan, float& heapOpSec, FILE* fileNode, FILE* fileW,int* nodes, int* ws, int count, int minIndex, int maxIndex, Node* ng) {
+        int pid = omp_get_thread_num();
+        // if (pid != 119) return;
+        CycleTimer heapOpTimer, perfTimer;
+        float perfS;
+        AdjacentMatrix::Arch *&archArray = matrix->archArray;
+        int *&g = matrix->g;
+        int *&result = matrix->result;
+
+#pragma noinline
+        heapOpTimer.Start();
+        int rnode = nodes[0];
+        _mm_prefetch((const char*)(ng + rnode - minIndex), _MM_HINT_T1);
+        _mm_prefetch((const char*)(ng + ng[rnode - minIndex].to[0] - minIndex), _MM_HINT_T1);
+        _mm_prefetch((const char*)(ng + ng[rnode - minIndex].to[1] - minIndex), _MM_HINT_T1);
+        _mm_prefetch((const char*)(ng + ng[rnode - minIndex].to[2] - minIndex), _MM_HINT_T1);
+        rnode = nodes[1];
+        _mm_prefetch((const char*)(ng + rnode - minIndex), _MM_HINT_T1);
+        _mm_prefetch((const char*)(ng + ng[rnode - minIndex].to[0] - minIndex), _MM_HINT_T1);
+        _mm_prefetch((const char*)(ng + ng[rnode - minIndex].to[1] - minIndex), _MM_HINT_T1);
+        _mm_prefetch((const char*)(ng + ng[rnode - minIndex].to[2] - minIndex), _MM_HINT_T1);
+        rnode = nodes[2];
+        _mm_prefetch((const char*)(ng + rnode - minIndex), _MM_HINT_T1);
+        _mm_prefetch((const char*)(ng + ng[rnode - minIndex].to[0] - minIndex), _MM_HINT_T1);
+        _mm_prefetch((const char*)(ng + ng[rnode - minIndex].to[1] - minIndex), _MM_HINT_T1);
+        _mm_prefetch((const char*)(ng + ng[rnode - minIndex].to[2] - minIndex), _MM_HINT_T1);
+
+        for (int idx = 0; idx < count - 5; idx += 3) {
+          int rnode = nodes[idx+3];
+          _mm_prefetch((const char*)(ng + rnode - minIndex), _MM_HINT_T1);
+          _mm_prefetch((const char*)(ng + ng[rnode - minIndex].to[0] - minIndex), _MM_HINT_T1);
+          _mm_prefetch((const char*)(ng + ng[rnode - minIndex].to[1] - minIndex), _MM_HINT_T1);
+          _mm_prefetch((const char*)(ng + ng[rnode - minIndex].to[2] - minIndex), _MM_HINT_T1);
+
+          rnode = nodes[idx+4];
+          _mm_prefetch((const char*)(ng + rnode - minIndex), _MM_HINT_T1);
+          _mm_prefetch((const char*)(ng + ng[rnode - minIndex].to[0] - minIndex), _MM_HINT_T1);
+          _mm_prefetch((const char*)(ng + ng[rnode - minIndex].to[1] - minIndex), _MM_HINT_T1);
+          _mm_prefetch((const char*)(ng + ng[rnode - minIndex].to[2] - minIndex), _MM_HINT_T1);
+
+          rnode = nodes[idx+5];
+          _mm_prefetch((const char*)(ng + rnode - minIndex), _MM_HINT_T1);
+          _mm_prefetch((const char*)(ng + ng[rnode - minIndex].to[0] - minIndex), _MM_HINT_T1);
+          _mm_prefetch((const char*)(ng + ng[rnode - minIndex].to[1] - minIndex), _MM_HINT_T1);
+          _mm_prefetch((const char*)(ng + ng[rnode - minIndex].to[2] - minIndex), _MM_HINT_T1);
+
+          int readnode = nodes[idx];
+          int curr = readnode - minIndex;
+          int readnode1 = nodes[idx+1];
+          int curr1 = readnode1 - minIndex;
+          int readnode2 = nodes[idx+2];
+          int curr2 = readnode2 - minIndex;
+
+
+          _mm_prefetch((const char*)(ng + readnode - minIndex), _MM_HINT_T1);
+          _mm_prefetch((const char*)(ng + ng[readnode - minIndex].to[0] - minIndex), _MM_HINT_T1);
+          _mm_prefetch((const char*)(ng + ng[readnode - minIndex].to[1] - minIndex), _MM_HINT_T1);
+          _mm_prefetch((const char*)(ng + ng[readnode - minIndex].to[2] - minIndex), _MM_HINT_T1);
+
+          _mm_prefetch((const char*)(ng + readnode1 - minIndex), _MM_HINT_T1);
+          _mm_prefetch((const char*)(ng + ng[readnode1 - minIndex].to[0] - minIndex), _MM_HINT_T1);
+          _mm_prefetch((const char*)(ng + ng[readnode1 - minIndex].to[1] - minIndex), _MM_HINT_T1);
+          _mm_prefetch((const char*)(ng + ng[readnode1 - minIndex].to[2] - minIndex), _MM_HINT_T1);
+
+          _mm_prefetch((const char*)(ng + readnode2 - minIndex), _MM_HINT_T1);
+          _mm_prefetch((const char*)(ng + ng[readnode2 - minIndex].to[0] - minIndex), _MM_HINT_T1);
+          _mm_prefetch((const char*)(ng + ng[readnode2 - minIndex].to[1] - minIndex), _MM_HINT_T1);
+          _mm_prefetch((const char*)(ng + ng[readnode2 - minIndex].to[2] - minIndex), _MM_HINT_T1);
+
+#ifdef PERF_SCAN
+          ++totalScan;
+#endif
+
+
+          
+#pragma unroll
+            for (int i = 0; i < 3; ++i) {
+                int &dst_node = ng[curr].to[i], &weight = ng[curr].w[i], new_dst_result = ng[curr].dist + weight;
+                if (dst_node >= minIndex && dst_node <= maxIndex) {
+                  if (ng[dst_node - minIndex].dist > new_dst_result) {
+                    ng[dst_node - minIndex].dist = new_dst_result;
+                  }
+                }
+            }
+
+#pragma unroll
+            for (int i = 0; i < 3; ++i) {
+                int &dst_node = ng[curr1].to[i], &weight = ng[curr1].w[i], new_dst_result = ng[curr1].dist + weight;
+                if (dst_node >= minIndex && dst_node <= maxIndex) {
+                  if (ng[dst_node - minIndex].dist > new_dst_result) {
+                    ng[dst_node - minIndex].dist = new_dst_result;
+                  }
+                }
+            }
+
+#pragma unroll
+            for (int i = 0; i < 3; ++i) {
+                int &dst_node = ng[curr2].to[i], &weight = ng[curr2].w[i], new_dst_result = ng[curr2].dist + weight;
+                if (dst_node >= minIndex && dst_node <= maxIndex) {
+                  if (ng[dst_node - minIndex].dist > new_dst_result) {
+                    ng[dst_node - minIndex].dist = new_dst_result;
+                  }
+                }
+            }
+        }
+#pragma noinline
+        heapOpTimer.Stop();
+        heapOpSec += heapOpTimer.GetSecond();
+        printf("pid = %d, perfS = %f\n", pid, perfS);
+        for (int i = minIndex; i <= maxIndex; i++)
+          result[i] = ng[i - minIndex].dist;
+    }
+
+    void adjust(AdjacentMatrix *matrix) {
+        int pid = omp_get_thread_num();
+        int *&result = matrix->result;
+        Utils::Item data;
+        int &src_node = data.key, &src_result = data.value;
+    }
+
+    void worker(AdjacentMatrix *matrix, int &totalScan, float & heapOpSec, FILE* file,
+                int count, Utils::Item* queue) {
+        int pid = omp_get_thread_num();
+
+        char nodePath[200]; sprintf(nodePath, "Dataset/nodes.%d", pid);
+        char wPath[200]; sprintf(wPath, "Dataset/ws.%d", pid);
+        const char* mode = "r";
+        FILE* fileNode = fopen(nodePath, mode);
+        FILE* fileW = fopen(wPath, mode);
+        int* nodes = (int*)memalign(256, sizeof(int) * count);
+        fread(nodes, sizeof(int), count, fileNode);
+        fclose(fileNode);
+        fclose(fileW);
+
+        int minIndex = INT_MAX, maxIndex = -1;
+        for (int i = 0; i < matrix->n; i++) {
+          if (colors[i] == pid) {
+            minIndex = std::min(minIndex, i);
+            maxIndex = std::max(maxIndex, i);
+          }
+        }
+        int *&g = matrix->g;
+        AdjacentMatrix::Arch *&archArray = matrix->archArray;
+        int *&result = matrix->result;
+        Node* ng = (Node*)_mm_malloc(sizeof(Node)* (maxIndex - minIndex + 1), 128);
+        for (int i = minIndex; i <= maxIndex; i++) {
+          ng[i - minIndex].dist = result[i];
+          for (int j = g[i]; j < g[i] + 3; j++) {
+            if (j < g[i+1]) {
+              ng[i - minIndex].to[j - g[i]] = archArray[j].j;
+              ng[i - minIndex].w[j - g[i]] = archArray[j].w;
+            } else {
+              ng[i - minIndex].to[j - g[i]] = minIndex;
+              ng[i - minIndex].w[j - g[i]] = INT_MAX / 2;
+            }
+          }
+        }
+        int sum = 0;
+        for (int i = minIndex; i <= maxIndex; i++) {
+          sum += ng[i - minIndex].to[0];
+        }
+        printf("sum = %d\n", sum);
+
+#pragma noinline
+        relax(matrix, totalScan, heapOpSec, NULL, NULL, nodes, NULL, count, minIndex, maxIndex, ng);
+        free(nodes);
+        _mm_free(ng);
+    }
+
+public:
+ SeperateDijk(int thread_num, const char * SOURCE_SRC, int num_relax_each_iteration) :
+    THREAD_NUM(thread_num), SOURCE_SRC(SOURCE_SRC), NUM_RELAX_EACH_ITERATION(num_relax_each_iteration), colors(NULL), label(NULL), unlabel(NULL) {
+        sprintf(name, "Dijstra + Adjustment + GlobalHeapStack: THREAD_NUM=%d, NUM_RELAX_EACH_ITERATION=%d", THREAD_NUM, NUM_RELAX_EACH_ITERATION);
+    }
+
+    const char * getName() {
+        return name;
+    }
+
+    void compute(AdjacentMatrix &adjMatrix, Colors *colors, int source, double &prepareTimeS, double &runningTimeS, double &totalScan, double &avgScan) {
+        omp_set_num_threads(THREAD_NUM);
+
+        CycleTimer prepareTimer, runningTimer;
+#ifdef PERF_SCAN
+        totalScan = 0;
+#endif
+
+        // Step 1: prepare Environment
+        prepareTimer.Start();
+
+        int &n = adjMatrix.n;
+        this->colors = colors->getColors();
+        this->label = colors->getlabel();
+        this->unlabel = colors->getunlabel();
+
+        int *&result = adjMatrix.result;
+        adjMatrix.resetResult();
+
+        /*
+         * create heaps and stacks for each thread
+         */
+
+        /**
+         * create and init shortestArc for each node
+         **/
+        AdjacentMatrix::Arch *&archArray = adjMatrix.archArray;
+        int *&g = adjMatrix.g;
+        adjMatrix.buildSimple();
+        shortestArc = new int[n];
+        for (int i = 0; i < n; i++) {
+          int result = INT_MAX;
+          for (int j = g[i]; j < g[i + 1]; j++) {
+            int &dst_node = archArray[j].j, &weight = archArray[j].w;
+            if (weight < result) result = weight;
+          }
+          shortestArc[i] = result;
+        }
+
+        /*
+         * create syncer
+         */
+        FILE* file = fopen(SOURCE_SRC, "rb");
+        if (file == NULL) {
+          perror("file fopen");
+        }
+        size_t nnode;
+        fread(&nnode, sizeof(size_t), 1, file);
+        for (int i = 0; i < nnode; i++) {
+          int node, val;
+          fread(&node, sizeof(int), 1, file);
+          fread(&val, sizeof(int), 1, file);
+          result[node] = val;
+        }
+        fclose(file);
+        prepareTimer.Stop();
+
+        // Step 2: start to compute
+        runningTimer.Start();
+
+        result[source] = 0;
+
+        float slowest = 0;
+#pragma omp parallel
+        {
+            int ts = 0;
+            CycleTimer threadTimer, fileTimer;
+            float heapOpSec = 0;
+            int pid = omp_get_thread_num();
+            Utils::Item *queue = NULL;
+            /* int fd = open(filename, O_RDONLY); */
+            /* assert(fd != -1); if (fd == -1) perror("open"); */
+            /* queue = (Utils::Item*)mmap(NULL, sizeof(Utils::Item)*colors->getNodeNumberCount()[pid], */
+            /*                            PROT_READ, MAP_ANONYMOUS | MAP_PRIVATE, fd, 0); */
+            /* if (queue == MAP_FAILED) perror("mmap"); */
+            /*  assert(queue != MAP_FAILED); */
+
+            threadTimer.Start();
+            worker(&adjMatrix, ts, heapOpSec, NULL, colors->getNodeNumberCount()[pid], queue);
+            threadTimer.Stop();
+#pragma omp critical
+            {
+              slowest = std::max(slowest, heapOpSec);
+            }
+            printf("pid = %d, sec = %lf, file sec = %lf, # of nodes = %d\n", pid, threadTimer.GetSecond(), heapOpSec,
+                   colors->getNodeNumberCount()[pid]);
+#ifdef PERF_SCAN
+#pragma omp atomic
+            totalScan += ts;
+#endif
+        }
+        runningTimer.Stop();
+        printf("slowest = %lf\n", slowest);
+        int nunreached = 0;
+        for (int i = 0; i < n; i++) {
+          if (adjMatrix.result[i] == BaseGraph::RESULT_MAX_VALUE) {
+            nunreached++;
+          }
+        }
+        printf("nunreached = %d, sizeof node = %u\n", nunreached, sizeof(Node));
+        // Step 3: destroy environment
+        prepareTimer.Start();
+
+
+        /*
+         * destroy heaps and stacks for each thread
+         */
+
+        prepareTimer.Stop();
+
+        runningTimeS = runningTimer.GetSecond();
+        prepareTimeS = prepareTimer.GetSecond();
+#ifdef PERF_SCAN
+        avgScan = totalScan / THREAD_NUM;
+#endif
+    }
+};
+
+
+#endif

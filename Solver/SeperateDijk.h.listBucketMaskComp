@@ -1,0 +1,388 @@
+#ifndef SPERATEDIJK_H_
+#define SPERATEDIJK_H_
+#include <sys/types.h>
+#include <sys/stat.h>
+#include <stdlib.h>
+#include <malloc.h>
+#include <fcntl.h>
+#include <sys/mman.h>
+#include <immintrin.h>
+#include <algorithm>
+#include <omp.h>
+#include "../Utils/ColorUtils.h"
+
+class SeperateDijk;
+
+struct Node {
+  int dist;
+  int to[3];
+  int w[3];
+  int prev; int next;
+} __attribute__((aligned(64)));;
+
+bool itemcmp(const Utils::Item& a, const Utils::Item& b) {
+  return a.value < b.value;
+}
+
+class ListBucket {
+public:
+  Utils::Item* sources;
+  int nsource;
+  int sourceIdx;
+  int maxW;
+  int maxIndex, minIndex;
+  int *buckets;
+  int nmask;
+  static const size_t maskDataSize = sizeof(unsigned __int64);
+  static const size_t maskCap = sizeof(unsigned __int64)*8;
+  unsigned __int64 *mask;
+  int nbucket;
+  Node* ng;
+  int baseW;
+  int st;
+  int size;
+  ListBucket(Utils::Item* sources, int nsource, int maxW, Node* ng)
+    : sources(sources), nsource(nsource), maxW(maxW),  ng(ng), 
+      baseW(0), st(0), sourceIdx(0), nbucket(maxW + 1), size(0)
+  {
+    buckets = new int[nbucket];
+    //buckets = (int*)_mm_malloc(sizeof(int) * nbucket, 64);
+    for (int i = 0; i < nbucket; i++)
+      buckets[i] = -1;
+    nmask = (nbucket + maskCap - 1) / maskCap;
+    mask = new unsigned __int64[nmask];
+    //mask = (unsigned __int64*)_mm_malloc(sizeof(__int64) * nmask, 64);
+    memset(mask, 0, maskDataSize*nmask);
+    std::sort(this->sources, this->sources + nsource, itemcmp);
+  }
+  ~ListBucket() {
+    //_mm_free(buckets);
+    //_mm_free(mask);
+  }
+  inline void setMask(int pos) {
+    int maskIdx = pos / maskCap;
+    mask[maskIdx] |= 1UL << (pos % maskCap);
+  }
+
+  inline void unsetMask(int pos) {
+    int maskIdx = pos / maskCap;
+    mask[maskIdx] &= ~(1UL << (pos % maskCap));
+  }
+
+  inline int findfirstone(int st) {
+    //if (buckets[st] != -1) return st;
+    int idx = st / maskCap;
+    if (mask[idx] >> (st % maskCap) != 0) {
+      int idxWithinMask = _mm_tzcnt_64(mask[idx] >> (st % maskCap)) + (st % maskCap);
+      int bucketIdx = idx * maskCap + idxWithinMask;
+      return bucketIdx;
+    } else {
+      int i = idx + 1;
+      if (i == nmask) i = 0;
+      while (mask[i] == 0) {
+        //printf("mask[%d] == 0\n", i);
+        i++; if (i == nmask) i = 0;
+      }
+      //printf("mask[%d] = %lu\n", i, mask[i]);
+      return i * maskCap + _mm_tzcnt_64(mask[i]);
+    }
+  }
+
+  inline void removeTop() {
+    if (size == 0) {
+      return;
+    }
+    buckets[st] = ng[buckets[st]].next;
+    size--;
+    if (buckets[st] == -1)
+      unsetMask(st);
+    if (size == 0) {
+      trySetToFirstSource();
+      addSources();
+      return;
+    } else {
+      int ffo = findfirstone(st);
+      int step = ffo - st;
+      if (step < 0) step += nbucket;
+      st = ffo;
+      baseW += step;
+      if (step != 0)
+        addSources();
+    }
+  }
+
+  inline void trySetToFirstSource() {
+    if (sourceIdx < nsource) {
+      baseW = sources[sourceIdx].value;
+    }
+  }
+
+  inline void addOrUpdate(int key, int value, int oldvalue = BaseGraph::RESULT_MAX_VALUE) {
+    if (oldvalue != BaseGraph::RESULT_MAX_VALUE) {
+      // remove from old bucket
+      int index = (st + oldvalue - baseW) % nbucket;
+      if (ng[key].prev == -1) {
+        buckets[index] = ng[key].next;
+        if (ng[key].next == -1) {
+          unsetMask(index);
+        } else {
+          ng[ng[key].next].prev = -1;
+        }
+      } else {
+        ng[ng[key].next].prev = ng[key].prev;
+        ng[ng[key].prev].next = ng[key].next;
+      }
+    } else {
+        size++;
+        ng[key].next = -1;
+    }
+
+    // add into new bucket
+    int newBucketIdx = (st + value - baseW) % nbucket;
+    ng[key].next = buckets[newBucketIdx];
+    if (ng[key].next != -1)
+      ng[ng[key].next].prev = key;
+    ng[key].prev = -1;
+    buckets[newBucketIdx] = key;
+    setMask(newBucketIdx);
+  }
+
+  void addSources() {
+    while (sourceIdx < nsource && sources[sourceIdx].value - baseW < nbucket) {
+      addOrUpdate(sources[sourceIdx].key, sources[sourceIdx].value);
+      sourceIdx++;
+    }
+  }
+};
+
+
+#include <climits>
+class SeperateDijk: public Solver<AdjacentMatrix> {
+
+    char name[1024];
+    const int THREAD_NUM, NUM_RELAX_EACH_ITERATION;
+    OMPLockStacks *stacks;
+    const char * SOURCE_SRC;
+    const int *colors, *label, *unlabel;
+
+  void relax(AdjacentMatrix *matrix, int &totalScan, float& heapOpSec, FILE* fileNode, FILE* fileW,int* nodes, int* ws, int count, int minIndex, int maxIndex, Node* ng, ListBucket& lb) {
+        int pid = omp_get_thread_num();
+        // if (pid != 119) return;
+        CycleTimer heapOpTimer, perfTimer;
+        float perfS;
+        AdjacentMatrix::Arch *&archArray = matrix->archArray;
+        int *&g = matrix->g;
+        int *&result = matrix->result;
+        Utils::Item data;
+        int &src_node = data.key, &src_result = data.value;
+
+#pragma noinline
+        heapOpTimer.Start();
+
+        while (lb.size != 0) {
+          int curr = lb.buckets[lb.st];
+#ifdef PERF_SCAN
+            ++totalScan;
+#endif
+#pragma unroll
+            for (int i = 0; i < 3; ++i) {
+              int &dst_node = ng[curr].to[i];
+              int &weight = ng[curr].w[i], new_dst_result = ng[curr].dist + weight;
+                if (dst_node >= minIndex && dst_node <= maxIndex) {
+                  if (ng[dst_node - minIndex].dist > new_dst_result) {
+                    int olddist = ng[dst_node - minIndex].dist;
+                    ng[dst_node - minIndex].dist = new_dst_result;
+                    lb.addOrUpdate(dst_node - minIndex, new_dst_result, olddist);
+                  }
+                }
+            }
+            lb.removeTop();
+        }
+#pragma noinline
+        heapOpTimer.Stop();
+        heapOpSec += heapOpTimer.GetSecond();
+        printf("pid = %d, perfS = %f\n", pid, perfS);
+    }
+
+    void adjust(AdjacentMatrix *matrix) {
+        int pid = omp_get_thread_num();
+        int *&result = matrix->result;
+        Utils::Item data;
+        int &src_node = data.key, &src_result = data.value;
+    }
+
+    void worker(AdjacentMatrix *matrix, int &totalScan, float & heapOpSec, FILE* file,
+                int count, std::vector<int>& sourceNodes, std::vector<int>& sourceVals) {
+        int pid = omp_get_thread_num();
+
+        AdjacentMatrix::Arch *&archArray = matrix->archArray;
+        int *&g = matrix->g;
+        int *&result = matrix->result;
+        Utils::Item data;
+        int &src_node = data.key, &src_result = data.value;
+
+        int minIndex = INT_MAX, maxIndex = -1;
+        for (int i = 0; i < matrix->n; i++) {
+          if (colors[i] == pid) {
+            minIndex = std::min(minIndex, i);
+            maxIndex = std::max(maxIndex, i);
+          }
+        }
+
+        int maxW = 0;
+        //printf("before _mm_malloc calls\n");
+        Node* ng = (Node*)_mm_malloc(sizeof(Node)* (maxIndex - minIndex + 1), 64);
+        //Node* ng = new Node[maxIndex - minIndex + 1];
+        //printf("after _mm_malloc calls\n");
+        for (int i = minIndex; i <= maxIndex; i++) {
+          ng[i - minIndex].dist = result[i];
+          for (int j = g[i]; j < g[i+1] && j < g[i] + 3; j++) {
+            if ( j < g[i+1]) {
+              ng[i - minIndex].to[j - g[i]] = archArray[j].j;
+              ng[i - minIndex].w[j - g[i]] = archArray[j].w;
+              maxW = std::max(archArray[j].w, maxW);
+            } else {
+              ng[i - minIndex].to[j - g[i]] = 0;
+              ng[i - minIndex].w[j - g[i]] = INT_MAX/2;
+            }
+          }
+        }
+        int sum = 0;
+        for (int i = minIndex; i <= maxIndex; i++) {
+          sum += ng[i - minIndex].to[0];
+        }
+
+        std::vector<Utils::Item> sources;
+        for (int i = 0; i < sourceNodes.size(); i++) {
+          Utils::Item item; item.key = sourceNodes[i] - minIndex;
+          item.value = sourceVals[i];
+          sources.push_back(item);
+        }
+        ListBucket lb(&sources[0], sources.size(), maxW, ng);
+        lb.trySetToFirstSource();
+        lb.addSources();
+        printf("sum = %d, lb.size = %d, sourceNodes.size == %d\n", sum, lb.size, sourceNodes.size());
+#pragma noinline
+        relax(matrix, totalScan, heapOpSec, NULL, NULL, NULL, NULL, count, minIndex, maxIndex, ng, lb);
+        for (int i = minIndex; i <= maxIndex; i++)
+          result[i] = ng[i - minIndex].dist;
+        //delete [] ng;
+        //_mm_free(ng);
+        //printf("mm_free finished\n");
+        //heaps->printStats(pid);
+    }
+
+public:
+ SeperateDijk(int thread_num, const char * SOURCE_SRC, int num_relax_each_iteration) :
+    THREAD_NUM(thread_num), SOURCE_SRC(SOURCE_SRC), NUM_RELAX_EACH_ITERATION(num_relax_each_iteration), colors(NULL), label(NULL), unlabel(NULL) {
+        sprintf(name, "Dijstra + Adjustment + GlobalHeapStack: THREAD_NUM=%d, NUM_RELAX_EACH_ITERATION=%d", THREAD_NUM, NUM_RELAX_EACH_ITERATION);
+    }
+
+    const char * getName() {
+        return name;
+    }
+
+    void compute(AdjacentMatrix &adjMatrix, Colors *colors, int source, double &prepareTimeS, double &runningTimeS, double &totalScan, double &avgScan) {
+        omp_set_num_threads(THREAD_NUM);
+
+        CycleTimer prepareTimer, runningTimer;
+#ifdef PERF_SCAN
+        totalScan = 0;
+#endif
+
+        // Step 1: prepare Environment
+        prepareTimer.Start();
+
+        int &n = adjMatrix.n;
+        this->colors = colors->getColors();
+        this->label = colors->getlabel();
+        this->unlabel = colors->getunlabel();
+
+        int *&result = adjMatrix.result;
+        adjMatrix.resetResult();
+
+        AdjacentMatrix::Arch *&archArray = adjMatrix.archArray;
+        int *&g = adjMatrix.g;
+
+
+        std::vector<int> sourceNodes[THREAD_NUM];
+        std::vector<int> sourceVals[THREAD_NUM];
+        FILE* file = fopen(SOURCE_SRC, "rb");
+        if (file == NULL) {
+          perror("file fopen");
+        }
+        size_t nnode;
+        fread(&nnode, sizeof(size_t), 1, file);
+        for (int i = 0; i < nnode; i++) {
+          int node, val;
+          fread(&node, sizeof(int), 1, file);
+          fread(&val, sizeof(int), 1, file);
+          sourceNodes[this->colors[node]].push_back(node);
+          sourceVals[this->colors[node]].push_back(val);
+          result[node] = val;
+        }
+        fclose(file);
+        prepareTimer.Stop();
+
+        // Step 2: start to compute
+        runningTimer.Start();
+
+        result[source] = 0;
+
+        float slowest = 0;
+#pragma omp parallel
+        {
+            int ts = 0;
+            CycleTimer threadTimer, fileTimer;
+            float heapOpSec = 0;
+            int pid = omp_get_thread_num();
+            Utils::Item *queue = NULL;
+            /* int fd = open(filename, O_RDONLY); */
+            /* assert(fd != -1); if (fd == -1) perror("open"); */
+            /* queue = (Utils::Item*)mmap(NULL, sizeof(Utils::Item)*colors->getNodeNumberCount()[pid], */
+            /*                            PROT_READ, MAP_ANONYMOUS | MAP_PRIVATE, fd, 0); */
+            /* if (queue == MAP_FAILED) perror("mmap"); */
+            /*  assert(queue != MAP_FAILED); */
+            threadTimer.Start();
+            worker(&adjMatrix, ts, heapOpSec, NULL, colors->getNodeNumberCount()[pid], sourceNodes[pid], sourceVals[pid]);
+            threadTimer.Stop();
+#pragma omp critical
+            {
+              slowest = std::max(slowest, heapOpSec);
+            }
+            printf("pid = %d, sec = %lf, file sec = %lf, # of nodes = %d\n", pid, threadTimer.GetSecond(), heapOpSec,
+                   colors->getNodeNumberCount()[pid]);
+#ifdef PERF_SCAN
+#pragma omp atomic
+            totalScan += ts;
+#endif
+        }
+        runningTimer.Stop();
+        printf("slowest = %lf\n", slowest);
+        int nunreached = 0;
+        for (int i = 0; i < n; i++) {
+          if (adjMatrix.result[i] == BaseGraph::RESULT_MAX_VALUE) {
+            nunreached++;
+          }
+        }
+        printf("nunreached = %d, sizeof node = %u\n", nunreached, sizeof(Node));
+        // Step 3: destroy environment
+        prepareTimer.Start();
+
+        /*
+         * destroy heaps and stacks for each thread
+         */
+
+        prepareTimer.Stop();
+
+        runningTimeS = runningTimer.GetSecond();
+        prepareTimeS = prepareTimer.GetSecond();
+#ifdef PERF_SCAN
+        avgScan = totalScan / THREAD_NUM;
+#endif
+    }
+};
+
+
+
+#endif

@@ -1,0 +1,350 @@
+#ifndef SPERATEDIJK_H_
+#define SPERATEDIJK_H_
+#include <sys/types.h>
+#include <sys/stat.h>
+#include <stdlib.h>
+#include <malloc.h>
+#include <fcntl.h>
+#include <sys/mman.h>
+#include <immintrin.h>
+#include <omp.h>
+#include "../Utils/ColorUtils.h"
+
+class SeperateDijk;
+
+namespace SeperateDijkUtils {
+    class Syncer {
+        omp_lock_t lock;
+        bool *marker;
+        int counter;
+        const int N;
+
+        inline void set(int p);
+
+        inline void unset(int p);
+
+    public:
+        Syncer(int n);
+
+        inline void setSafe(int p, SeperateDijk * const solver);
+
+        inline void unsetSafe(int p);
+
+        bool ready(int p);
+
+        bool ready();
+
+        ~Syncer();
+    };
+}
+
+using Utils::Heaps;
+using Utils::OMPLockStacks;
+
+const int RBSize = 128;
+
+template<class T>
+class RingBuffer {
+public:
+  T buffer[RBSize];
+  int head, tail;
+  RingBuffer() : tail(0), head(0) {
+  }
+
+  inline bool empty() {
+    return head == tail;
+  }
+  inline bool full() {
+    // printf("tail = %d, head = %d, ((tail + 1) % RBSize) = %d\n, tail, head, ((tail + 1) % RBSize)",
+    //        tail, head, ((tail + 1) % RBSize));
+    return ((tail + 1) % RBSize) == head;
+  }
+
+  // check full() before calling this.
+  inline void insert(const T& item) {
+    buffer[tail] = item;
+    tail++;
+    tail %= RBSize;
+  }
+
+  // check empty() before calling this.
+  inline T& pop() {
+    T& result = buffer[head];
+    head++;
+    head %= RBSize;
+    return result;
+  }
+};
+
+#include <climits>
+
+class SeperateDijk: public Solver<AdjacentMatrix> {
+
+    char name[1024];
+    const int THREAD_NUM, NUM_RELAX_EACH_ITERATION;
+    Heaps *heaps;
+    OMPLockStacks *stacks;
+    const char * SOURCE_SRC;
+    const int *colors, *label, *unlabel;
+
+    int *shortestArc;
+    SeperateDijkUtils::Syncer *syncer;
+
+    friend class SeperateDijkUtils::Syncer;
+
+    void relax(AdjacentMatrix *matrix, int &totalScan, float& heapOpSec, FILE* fileNode, FILE* fileW,int* nodes, int* ws, int count, Utils::Item* queue) {
+        int pid = omp_get_thread_num();
+        CycleTimer heapOpTimer, perfTimer;
+        float perfS;
+
+        heapOpTimer.Start();
+        AdjacentMatrix::Arch *&archArray = matrix->archArray;
+        int *&g = matrix->g;
+        int *&result = matrix->result;
+        Utils::Item data;
+        int &src_node = data.key, &src_result = data.value;
+
+        while (!heaps->empty(pid)) {
+          heaps->removeTop(pid, &data);
+          if (result[src_node] > src_result) result[src_node] = src_result;
+#ifdef PERF_SCAN
+          ++totalScan;
+#endif
+          for (int i = g[src_node]; i < g[src_node + 1]; ++i) {
+            int &dst_node = archArray[i].j, &weight = archArray[i].w, new_dst_result = src_result + weight;
+            if (colors[dst_node] == pid) {
+              if (result[dst_node] > new_dst_result) {
+                heaps->addOrUpdate(pid, dst_node, new_dst_result);
+              }
+            }
+          }
+        }
+        heapOpTimer.Stop();
+        heapOpSec += heapOpTimer.GetSecond();
+        printf("pid = %d, perfS = %f\n", pid, perfS);
+    }
+
+    void adjust(AdjacentMatrix *matrix) {
+        int pid = omp_get_thread_num();
+        int *&result = matrix->result;
+        Utils::Item data;
+        int &src_node = data.key, &src_result = data.value;
+    }
+
+    void worker(AdjacentMatrix *matrix, int &totalScan, float & heapOpSec, FILE* file,
+                int count, Utils::Item* queue) {
+        int pid = omp_get_thread_num();
+        //if (pid != 74) return ;
+        /* while (!syncer->ready()) { */
+        /*     relax(matrix, totalScan); */
+        /*     //adjust(matrix); */
+        /*     // check */
+        /*     if (heaps->empty(pid) && stacks->empty(pid)) */
+        /*         syncer->setSafe(pid, this); */
+        /*     else */
+        /*         syncer->unsetSafe(pid); */
+        /* } */
+        /* while (!heaps->empty(pid)) { */
+        /*   relax(matrix, totalScan, heapOpSec, file); */
+        /* } */
+        /* while (!feof(file)) { */
+        /*   relax(matrix, totalScan, heapOpSec, file); */
+        /* } */
+
+        // update count for
+        // int nthd = 120;
+        // int n = matrix->n;
+        // int step = (n + nthd - 1) / nthd;
+        // int start = pid * step;
+        // int end = (pid + 1) * step;
+        // if (end > n) end = n;
+        // count = end - start;
+        //printf("pid = %d, count = %d\n", pid, count);
+        //
+        char nodePath[200]; sprintf(nodePath, "Dataset/nodes.%d", pid);
+        char wPath[200]; sprintf(wPath, "Dataset/ws.%d", pid);
+        relax(matrix, totalScan, heapOpSec, NULL, NULL, NULL, NULL, count, queue);
+        //heaps->printStats(pid);
+    }
+
+public:
+ SeperateDijk(int thread_num, const char * SOURCE_SRC, int num_relax_each_iteration) :
+    THREAD_NUM(thread_num), SOURCE_SRC(SOURCE_SRC), NUM_RELAX_EACH_ITERATION(num_relax_each_iteration), heaps(NULL), stacks(NULL), colors(NULL), label(NULL), unlabel(NULL), syncer(NULL) {
+        sprintf(name, "Dijstra + Adjustment + GlobalHeapStack: THREAD_NUM=%d, NUM_RELAX_EACH_ITERATION=%d", THREAD_NUM, NUM_RELAX_EACH_ITERATION);
+    }
+
+    const char * getName() {
+        return name;
+    }
+
+    void compute(AdjacentMatrix &adjMatrix, Colors *colors, int source, double &prepareTimeS, double &runningTimeS, double &totalScan, double &avgScan) {
+        omp_set_num_threads(THREAD_NUM);
+
+        CycleTimer prepareTimer, runningTimer;
+#ifdef PERF_SCAN
+        totalScan = 0;
+#endif
+
+        // Step 1: prepare Environment
+        prepareTimer.Start();
+
+        int &n = adjMatrix.n;
+        this->colors = colors->getColors();
+        this->label = colors->getlabel();
+        this->unlabel = colors->getunlabel();
+
+        int *&result = adjMatrix.result;
+        adjMatrix.resetResult();
+
+
+        /*
+         * create heaps and stacks for each thread
+         */
+        heaps = new Heaps(n, THREAD_NUM, colors->getNodeNumberCount());
+        stacks = new OMPLockStacks(n, THREAD_NUM, colors->getNodeNumberCount(), label);
+
+        /**
+         * create and init shortestArc for each node
+         **/
+        AdjacentMatrix::Arch *&archArray = adjMatrix.archArray;
+        int *&g = adjMatrix.g;
+        adjMatrix.buildSimple();
+        shortestArc = new int[n];
+        for (int i = 0; i < n; i++) {
+          int result = INT_MAX;
+          for (int j = g[i]; j < g[i + 1]; j++) {
+            int &dst_node = archArray[j].j, &weight = archArray[j].w;
+            if (weight < result) result = weight;
+          }
+          shortestArc[i] = result;
+        }
+
+        /*
+         * create syncer
+         */
+        syncer = new SeperateDijkUtils::Syncer(THREAD_NUM);
+        FILE* file = fopen(SOURCE_SRC, "rb");
+        if (file == NULL) {
+          perror("file fopen");
+        }
+        size_t nnode;
+        fread(&nnode, sizeof(size_t), 1, file);
+        for (int i = 0; i < nnode; i++) {
+          int node, val;
+          fread(&node, sizeof(int), 1, file);
+          fread(&val, sizeof(int), 1, file);
+          heaps->addOrUpdate(this->colors[node], node, val);
+          result[node] = val;
+        }
+        fclose(file);
+        prepareTimer.Stop();
+
+        // Step 2: start to compute
+        runningTimer.Start();
+
+        result[source] = 0;
+        heaps->addOrUpdate(this->colors[source], source, 0);
+
+#pragma omp parallel
+        {
+            int ts = 0;
+            CycleTimer threadTimer, fileTimer;
+            float heapOpSec = 0;
+            int pid = omp_get_thread_num();
+            Utils::Item *queue = NULL;
+            /* int fd = open(filename, O_RDONLY); */
+            /* assert(fd != -1); if (fd == -1) perror("open"); */
+            /* queue = (Utils::Item*)mmap(NULL, sizeof(Utils::Item)*colors->getNodeNumberCount()[pid], */
+            /*                            PROT_READ, MAP_ANONYMOUS | MAP_PRIVATE, fd, 0); */
+            /* if (queue == MAP_FAILED) perror("mmap"); */
+            /*  assert(queue != MAP_FAILED); */
+
+            threadTimer.Start();
+            worker(&adjMatrix, ts, heapOpSec, NULL, colors->getNodeNumberCount()[pid], queue);
+            threadTimer.Stop();
+            printf("pid = %d, sec = %lf, file sec = %lf, # of nodes = %d\n", pid, threadTimer.GetSecond(), heapOpSec,
+                   colors->getNodeNumberCount()[pid]);
+#ifdef PERF_SCAN
+#pragma omp atomic
+            totalScan += ts;
+#endif
+        }
+
+        runningTimer.Stop();
+        int nunreached = 0;
+        for (int i = 0; i < n; i++) {
+          if (adjMatrix.result[i] == BaseGraph::RESULT_MAX_VALUE) {
+            nunreached++;
+          }
+        }
+        printf("nunreached = %d\n", nunreached);
+        // Step 3: destroy environment
+        prepareTimer.Start();
+
+        delete syncer;
+
+        /*
+         * destroy heaps and stacks for each thread
+         */
+        delete stacks;
+        delete heaps;
+
+        prepareTimer.Stop();
+
+        runningTimeS = runningTimer.GetSecond();
+        prepareTimeS = prepareTimer.GetSecond();
+#ifdef PERF_SCAN
+        avgScan = totalScan / THREAD_NUM;
+#endif
+    }
+};
+
+namespace SeperateDijkUtils {
+
+    inline void Syncer::set(int p) {
+        if (!marker[p]) ++counter;
+        marker[p] = true;
+    }
+
+    inline void Syncer::unset(int p) {
+        if (marker[p]) --counter;
+        marker[p] = false;
+    }
+
+    Syncer::Syncer(int n) :
+            counter(0), N(n) {
+        omp_init_lock(&lock);
+        marker = (bool*) malloc(n * sizeof(bool));
+        memset(marker, 0, sizeof(bool) * n);
+    }
+
+    inline void Syncer::setSafe(int p, SeperateDijk * const solver) {
+        if (marker[p]) return;
+        omp_set_lock(&lock);
+        if (solver->heaps->empty(p) && solver->stacks->empty(p)) set(p);
+        omp_unset_lock(&lock);
+    }
+
+    inline void Syncer::unsetSafe(int p) {
+        if (!marker[p]) return;
+        omp_set_lock(&lock);
+        unset(p);
+        omp_unset_lock(&lock);
+    }
+
+    bool Syncer::ready(int p) {
+        return marker[p];
+    }
+
+    bool Syncer::ready() {
+        return counter == N;
+    }
+
+    Syncer::~Syncer() {
+        free(marker);
+        omp_destroy_lock(&lock);
+    }
+
+}
+
+#endif

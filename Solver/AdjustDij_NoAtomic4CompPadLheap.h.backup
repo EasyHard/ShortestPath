@@ -1,0 +1,361 @@
+#ifndef ADJUSTDIJ_NOATOMIC4Pad_H_
+#define ADJUSTDIJ_NOATOMIC4Pad_H_
+
+#include <assert.h>
+#include <stdlib.h>
+#include <malloc.h>
+#include "../Utils/ColorUtils.h"
+#include <tbb/tbb_allocator.h>
+
+namespace AdjustDij_NoAtomic4PadUtils {
+    static const int PUSH_RETRY_TIMES = 5;
+    static const int CAPACITY = 256;
+}
+
+using Utils::Node;
+using Utils::LeanHeap;
+
+class AdjustDij_NoAtomic4Pad: public Solver<AdjacentMatrix> {
+    char name[1024];
+    const int THREAD_NUM, NUM_RELAX_EACH_ITERATION;
+
+    LeanHeap *lheaps[240];
+    typedef Utils::TwoDConcurrentQueue<AdjustDij_NoAtomic4PadUtils::CAPACITY> TwoDConcurrentQueueType;
+
+    TwoDConcurrentQueueType *queues;
+
+    const int *colors;
+
+    enum State {
+        STATE_ACTIVE, STATE_READY_TO_STOP
+    };
+
+    volatile int *versions;
+
+    /*
+     * try to relax nodes belong to current thread according to current knowledge, and update new value.
+     */
+
+  void relax(const int &pid, int &totalScan, Node* ng, int minIndex, int maxIndex, LeanHeap* lheap) {
+        int left = NUM_RELAX_EACH_ITERATION;
+        while (left > 0 && lheap->size != 0) {
+            int curr = lheap->heap[0].key;
+            int src_result = ng[curr].dist;
+            bool frontier = ng[curr].frontier;
+              _mm_prefetch((const char*)(ng + lheap->heap[1].key), _MM_HINT_T1);
+              _mm_prefetch((const char*)(ng + ng[lheap->heap[1].key].to[0]), _MM_HINT_T1);
+              _mm_prefetch((const char*)(ng + ng[lheap->heap[1].key].to[1]), _MM_HINT_T1);
+              _mm_prefetch((const char*)(ng + ng[lheap->heap[1].key].to[2]), _MM_HINT_T1);
+              _mm_prefetch((const char*)(ng + ng[lheap->heap[1].key].to[3]), _MM_HINT_T1);
+              _mm_prefetch((const char*)(ng + lheap->heap[2].key), _MM_HINT_T1);
+              _mm_prefetch((const char*)(ng + ng[lheap->heap[2].key].to[0]), _MM_HINT_T1);
+              _mm_prefetch((const char*)(ng + ng[lheap->heap[2].key].to[1]), _MM_HINT_T1);
+              _mm_prefetch((const char*)(ng + ng[lheap->heap[2].key].to[2]), _MM_HINT_T1);
+              _mm_prefetch((const char*)(ng + ng[lheap->heap[2].key].to[3]), _MM_HINT_T1);
+
+            /*
+             * relax according to src_node
+             */
+            bool push_ret = true;
+#ifdef PERF_SCAN
+            ++totalScan;
+#endif
+            // for (int i = g[src_node]; i < g[src_node + 1]; ++i) {
+            //     int &dst_node = archArray[i].j, &weight = archArray[i].w, new_dst_result = src_result + weight;
+            _mm_prefetch((const char*)(ng+ng[curr].to[0]), _MM_HINT_T0);
+            _mm_prefetch((const char*)(ng+ng[curr].to[1]), _MM_HINT_T0);
+            _mm_prefetch((const char*)(ng+ng[curr].to[2]), _MM_HINT_T0);
+            _mm_prefetch((const char*)(ng+ng[curr].to[3]), _MM_HINT_T0);
+#pragma unroll
+            for (int i = 0; i < 4; ++i) {
+              int dst_node = ng[curr].to[i];
+              int weight = ng[curr].w[i], new_dst_result = src_result + weight;
+                /*
+                 * case colors[dst_node]==pid, we get right result[dst_node]
+                 */
+              if (ng[curr].tocolor[i] == pid &&
+                    ng[dst_node].dist > new_dst_result) {
+                  ng[dst_node].dist = new_dst_result;
+                  lheap->addOrUpdate(dst_node, new_dst_result);
+                }
+            }
+
+            if (frontier) {
+#pragma unroll
+              for (int i = 0; i < 4; ++i) {
+                int dst_node = ng[curr].to[i];
+                int weight = ng[curr].w[i], new_dst_result = src_result + weight;
+                // case colors[dst_node]!=pid, current thread may have a cache value, but the cache value must be bigger than the actural one.
+                if (ng[curr].tocolor[i] != pid) {
+                  push_ret = false;
+                  Utils::SmallConcurrentQueue<AdjustDij_NoAtomic4Utils::CAPACITY>* dst_queue = queues->get(ng[curr].tocolor[i], pid);
+                  for (int tmp = 0; tmp < AdjustDij_NoAtomic4Utils::PUSH_RETRY_TIMES; ++tmp) {
+                    push_ret = dst_queue->push(dst_node, new_dst_result);
+                    if (push_ret) break;
+                  }
+                  if (!push_ret) break;
+                }
+              }
+            }
+            if (!push_ret) {
+                //push fails, go to adjust and later retry relax
+                lheap->addOrUpdate(curr, src_result);
+                break;
+            } else {
+              lheap->removeTop(NULL);
+                --left;
+            }
+        }
+    }
+
+  void adjust(const int &pid, Node* ng, int minIndex, LeanHeap* lheap) {
+        Utils::Item data;
+        int &src_node = data.key, &src_result = data.value;
+        for (int i = 0; i < THREAD_NUM; ++i) {
+            while (queues->get(pid, i)->pop(data))
+                if (ng[src_node - minIndex].dist > src_result) {
+                    ng[src_node - minIndex].dist = src_result;
+                    lheap->addOrUpdate(src_node - minIndex, src_result);
+                }
+        }
+    }
+
+  inline bool isUpdateQueueEmpty(const int &pid, double& perf) {
+    bool empty;
+    Utils::SmallConcurrentQueue<AdjustDij_NoAtomic4Utils::CAPACITY>* q = queues->queues;
+    int curr = pid * 256;
+    for (int i = 0; i < THREAD_NUM; ++i) {
+      empty = q[curr + i].empty();
+      if (!empty) return false;
+    }
+    return true;
+  }
+
+  bool isHeapQueueEmpty(const int &pid, LeanHeap* lheap, double& perf) {
+    bool lheapEmpty, qEmpty;
+    lheapEmpty = lheap->size == 0;
+    if (!lheapEmpty) return false;
+    RdtscTimer timer; timer.Start();
+#pragma noinline
+    qEmpty = isUpdateQueueEmpty(pid, perf);
+      timer.Stop();
+      perf += timer.GetSecond();
+
+    return qEmpty;
+    // if (qEmpty) return true;
+    //return lheapEmpty && isUpdateQueueEmpty(pid);
+  }
+
+  bool isSomeActive(volatile int* versions, int* localVersions, double& perf) {
+    bool active = false;
+    for (int i = 0; i < THREAD_NUM && !active; ++i) {
+      if (versions[i] >= 0) active = true;
+      localVersions[i] = versions[i];
+    }
+    return active;
+  }
+
+  bool isNotEmpty(volatile int&myVersion, double& perf, LeanHeap* lheap, int pid) {
+    bool notEmpty = false;
+    bool heapQEmpty;
+      heapQEmpty = isHeapQueueEmpty(pid, lheap, perf);
+    if (!heapQEmpty) {
+      myVersion = ~myVersion;
+      notEmpty = true;
+    }
+    return notEmpty;
+  }
+    void worker(AdjacentMatrix *matrix, int &totalScan, Node* ng, LeanHeap* lheap,
+                int minIndex, int maxIndex, double& perf) {
+        const int pid = omp_get_thread_num();
+        volatile int &myVersion = ((volatile int*) versions)[pid];
+        int localVersions[THREAD_NUM];
+        RdtscTimer relaxTimer;
+        bool more = true;
+        while (more) {
+            if (myVersion >= 0) {
+              relax(pid, totalScan, ng, minIndex, maxIndex, lheap);
+              adjust(pid, ng, minIndex, lheap);
+#pragma noinline
+              if (isHeapQueueEmpty(pid, lheap, perf)) myVersion = ~((myVersion + 1) & 0x80000000);
+            } else {
+              bool notEmpty;
+#pragma noinline
+              notEmpty = isNotEmpty(myVersion, perf, lheap, pid);
+              if (notEmpty) {
+                continue;
+              }
+
+              bool active;
+#pragma noinline
+              active = isSomeActive(versions, localVersions, perf);
+              if (active) {
+                continue;
+              }
+              bool someStateIsActive = false;
+                bool isFinished = true;
+                for (int i = 0; i < THREAD_NUM && !someStateIsActive && isFinished; ++i) {
+                    if (versions[i] >= 0) someStateIsActive = true;
+                    if (localVersions[i] != versions[i]) isFinished = false;
+                }
+
+                if (someStateIsActive) continue;
+                if (isFinished) more = false;
+                break;
+            }
+        }
+    }
+
+public:
+    AdjustDij_NoAtomic4Pad(int thread_num, int num_relax_each_iteration) :
+            THREAD_NUM(thread_num), NUM_RELAX_EACH_ITERATION(num_relax_each_iteration), queues(NULL), colors(NULL), versions(NULL) {
+        sprintf(name, "Dijstra + Adjustment + NoAtomic4Pad: THREAD_NUM=%d, NUM_RELAX_EACH_ITERATION=%d", THREAD_NUM, NUM_RELAX_EACH_ITERATION);
+    }
+
+    const char * getName() {
+        return name;
+    }
+
+    void compute(AdjacentMatrix &adjMatrix, Colors *colors, int source, double &prepareTimeS, double &runningTimeS, double &totalScan, double &avgScan) {
+        omp_set_num_threads(THREAD_NUM);
+
+        CycleTimer prepareTimer, runningTimer;
+#ifdef PERF_SCAN
+        totalScan = 0;
+#endif
+
+        // Step 1: prepare Environment
+        prepareTimer.Start();
+        int &n = adjMatrix.n;
+        this->colors = colors->getColors();
+        adjMatrix.reallocResultPad();
+        int *&result = adjMatrix.result;
+        adjMatrix.resetResultPad();
+        /*
+         * create heaps and queues for each thread
+         */
+        queues = new TwoDConcurrentQueueType(THREAD_NUM);
+        for (int i = 0; i < THREAD_NUM; i++) {
+        }
+        /*
+         * create sync protocol for each thread
+         */
+        versions = (int *) _mm_malloc(sizeof(int) * THREAD_NUM * 64, 64);
+        memset((void*) versions, 0, sizeof(int) * THREAD_NUM * 64);
+
+        prepareTimer.Stop();
+
+        // Step 2: start to compute
+        runningTimer.Start();
+
+        result[source] = 0;
+        double slowest = 0; int sSum = 1; int maxCap = 0;
+#pragma omp parallel
+        {
+
+          int pid = omp_get_thread_num();
+          AdjacentMatrix::Arch *&archArray = adjMatrix.archArray;
+          int *&g = adjMatrix.g;
+          int *&result = adjMatrix.result;
+
+          int minIndex = INT_MAX, maxIndex = -1;
+          for (int i = 0; i < adjMatrix.nafterpad; i++) {
+            if (this->colors[i] == pid) {
+              minIndex = std::min(minIndex, i);
+              maxIndex = std::max(maxIndex, i);
+            }
+          }
+          Node* ng = (Node*)_mm_malloc(sizeof(Node)* (maxIndex - minIndex + 1), 256);
+          assert(ng != NULL);
+          for (int i = minIndex; i <= maxIndex; i++) {
+            ng[i - minIndex].dist = result[i];
+            ng[i - minIndex].heapIndex = -1;
+            ng[i - minIndex].frontier = false;
+            for (int j = 0; j < 4; j++) {
+              int dst = adjMatrix.tos[i*4+j];
+              if (this->colors[dst] != pid)
+                ng[i - minIndex].frontier = true;
+              if (dst != -1) {
+                if (dst >= minIndex && dst <= maxIndex) {
+                  ng[i - minIndex].to[j] = dst - minIndex;
+                  ng[i - minIndex].w[j] = adjMatrix.ws[i*4+j];
+                  ng[i - minIndex].tocolor[j] = this->colors[dst];
+                } else {
+                  ng[i - minIndex].to[j] = dst;
+                  ng[i - minIndex].w[j] = adjMatrix.ws[i*4+j];
+                  ng[i - minIndex].tocolor[j] = this->colors[dst];
+                }
+              } else {
+                ng[i - minIndex].to[j] = i - minIndex;
+                ng[i - minIndex].w[j] = INT_MAX/2;
+                ng[i - minIndex].tocolor[j] = this->colors[i];
+              }
+            }
+          }
+          int sum = 0;
+          for (int i = minIndex; i <= maxIndex; i++) {
+            sum += ng[i - minIndex].to[0];
+            assert(ng[i - minIndex].heapIndex == -1);
+          }
+          lheaps[pid] = new LeanHeap(2048, ng);
+          if (this->colors[source] == pid) {
+            lheaps[pid]->add(source - minIndex, 0);
+          }
+#pragma omp barrier
+          double perf = 0;
+            RdtscTimer localTimer;
+#pragma noinline
+            localTimer.Start();
+            int ts = 0;
+#pragma noinline
+            worker(&adjMatrix, ts, ng, lheaps[pid], minIndex, maxIndex, perf);
+#pragma noinline
+            localTimer.Stop();
+            for (int i = minIndex; i <= maxIndex; i++) {
+              result[i] = ng[i - minIndex].dist;
+            }
+            // for (int i = minIndex; i <= maxIndex; i++) {
+            //   assert(result[i] != BaseGraph::RESULT_MAX_VALUE);
+            // }
+            printf("pid = %d, ts = %d, # of node = %d, sec = %lf, perf = %lf\n",
+                   pid, ts, maxIndex - minIndex + 1, localTimer.GetSecond(), perf);
+#ifdef PERF_SCAN
+#pragma omp atomic
+            totalScan += ts;
+#endif
+#pragma omp critical
+            {
+              slowest = std::max(localTimer.GetSecond(), slowest);
+              maxCap = std::max(maxCap, lheaps[pid]->cap);
+              sSum += sum;
+              _mm_free(ng);
+              delete lheaps[pid];
+            }
+        }
+        runningTimer.Stop();
+        printf("slowest = %lf sSum = %d maxCap = %d\n", slowest, sSum, maxCap);
+        printf("checkSumPad = 0x%x\n", adjMatrix.checkSumPad());
+        // Step 3: destroy environment
+        prepareTimer.Start();
+
+        /*
+         * destroy sync protocol for each thread
+         */
+        _mm_free((void *) versions);
+
+        /*
+         * destroy heaps and queues for each thread
+         */
+        delete queues;
+
+        prepareTimer.Stop();
+
+        runningTimeS = runningTimer.GetSecond();
+        prepareTimeS = prepareTimer.GetSecond();
+#ifdef PERF_SCAN
+        avgScan = totalScan / THREAD_NUM;
+#endif
+    }
+};
+
+#endif

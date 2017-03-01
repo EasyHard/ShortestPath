@@ -1,0 +1,6 @@
+#!/bin/bash
+make RunSolver
+tmpfile=$(mktemp)
+cat
+graph=./Dataset/USA-road-d.CTR.obj.gr
+>tmpfile

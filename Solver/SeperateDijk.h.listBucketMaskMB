@@ -1,0 +1,520 @@
+#ifndef SPERATEDIJK_H_
+#define SPERATEDIJK_H_
+#include <sys/types.h>
+#include <sys/stat.h>
+#include <stdlib.h>
+#include <malloc.h>
+#include <fcntl.h>
+#include <sys/mman.h>
+#include <immintrin.h>
+#include <omp.h>
+#include <algorithm>
+#include "../Utils/ColorUtils.h"
+
+class SeperateDijk;
+
+namespace SeperateDijkUtils {
+    class Syncer {
+        omp_lock_t lock;
+        bool *marker;
+        int counter;
+        const int N;
+
+        inline void set(int p);
+
+        inline void unset(int p);
+
+    public:
+        Syncer(int n);
+
+        inline void setSafe(int p, SeperateDijk * const solver);
+
+        inline void unsetSafe(int p);
+
+        bool ready(int p);
+
+        bool ready();
+
+        ~Syncer();
+    };
+}
+
+using Utils::Heaps;
+using Utils::OMPLockStacks;
+
+#include <climits>
+
+struct ListBucketItem {
+  int prev;
+  int next;
+};
+
+bool itemcmp(const Utils::Item& a, const Utils::Item& b) {
+  return a.value < b.value;
+}
+
+#define DivAndRoundup(x, y) (((x)+(y)-1) / (y))
+
+class ListBucket {
+public:
+  Utils::Item* sources;
+  int nsource;
+  int sourceIdx;
+  int maxW;
+  int maxIndex, minIndex;
+  ListBucketItem *data;
+  int *buckets;
+  int nmask;
+  int nmaskTop;
+  static const size_t maskDataSize = sizeof(unsigned __int64);
+  static const size_t maskCap = sizeof(unsigned __int64)*8;
+  static const size_t bucketSize = 128;
+  unsigned __int64 *mask;
+  unsigned __int64 *maskTop;
+  int nbucket;
+  int baseW;
+  int st;
+  int size;
+  ListBucket(Utils::Item* sources, int nsource, int maxW, int maxIndex, int minIndex)
+    : sources(sources), nsource(nsource), maxW(maxW),  maxIndex(maxIndex), minIndex(minIndex),
+      baseW(0), st(0), sourceIdx(0), nbucket(DivAndRoundup(maxW + 1, bucketSize)), size(0)
+  {
+    data = new ListBucketItem[maxIndex - minIndex + 1];
+    buckets = new int[nbucket];
+    for (int i = 0; i < nbucket; i++)
+      buckets[i] = -1;
+    nmask = (nbucket + maskCap - 1) / maskCap;
+    nmaskTop = (nmask + maskCap - 1) / maskCap;
+    mask = new unsigned __int64[nmask];
+    maskTop = new unsigned __int64[nmaskTop];
+    memset(mask, 0, maskDataSize*nmask);
+    memset(maskTop, 0, maskDataSize*nmaskTop);
+    std::sort(this->sources, this->sources + nsource, itemcmp);
+  }
+  ~ListBucket() {
+    //printf("deconstructing\n");
+    //delete [] data;
+    delete [] buckets;
+    //printf("deconstructing done\n");
+  }
+  inline void setMask(int pos) {
+    //printf("setMask pos = %d\n", pos);
+    int maskIdx = pos / maskCap;
+    //printf("setMask maskIdx = %d, m = %lu\n", maskIdx, 1UL << (pos % maskCap));
+    mask[maskIdx] |= 1UL << (pos % maskCap);
+    // maskTop[maskIdx / maskCap] |= 1 << (maskIdx % maskCap);
+  }
+
+  inline void unsetMask(int pos) {
+    //printf("unsetMask pos = %d\n", pos);
+    int maskIdx = pos / maskCap;
+    mask[maskIdx] &= ~(1UL << (pos % maskCap));
+    // if (mask[maskIdx] == 0)
+    //   maskTop[maskIdx / maskCap] &= ~(1UL << (maskIdx % maskCap));
+    //printf("unsetFinished\n");
+  }
+
+  inline int findfirstone(int st) {
+    //printf("ffo st = %d\n", st);
+    if (buckets[st] != -1) return st;
+    int idx = st / maskCap;
+    if (mask[idx] >> (st % maskCap) != 0) {
+      int idxWithinMask = _mm_tzcnt_64(mask[idx] >> (st % maskCap)) + (st % maskCap);
+      int bucketIdx = idx * maskCap + idxWithinMask;
+      return bucketIdx;
+    } else {
+      int i = idx + 1;
+      if (i == nmask) i = 0;
+      while (mask[i] == 0) {
+        //printf("mask[%d] == 0\n", i);
+        i++; if (i == nmask) i = 0;
+      }
+      //printf("mask[%d] = %lu\n", i, mask[i]);
+      return i * maskCap + _mm_tzcnt_64(mask[i]);
+    }
+  }
+
+  void getTop(Utils::Item &output) {
+    if (size == 0) {
+      checkSources();
+      if (size == 0) {
+        output.key = -1;
+        output.value = 0;
+        return;
+      }
+    }
+    int dataIdx = buckets[st];
+    output.key = minIndex + dataIdx;
+    output.value = baseW*bucketSize;
+  }
+
+  void removeTop() {
+    if (size == 0) {
+      return;
+    }
+    buckets[st] = data[buckets[st]].next;
+    size--;
+    if (buckets[st] == -1)
+      unsetMask(st);
+    if (size == 0) {
+      return;
+    }
+    // int i = st; int step = 0;
+    // while (buckets[i] == -1) {
+    //   i++; step++;
+    //   if (i == nbucket) i = 0;
+    // }
+    //int ffo = findfirstone(st);
+    //printf("st = %d, findfirstone(st) = %d, i = %d\n", st, ffo, i);
+    //assert(ffo == i);
+    // st = i
+    int ffo = findfirstone(st);
+    int step = ffo - st;
+    if (step < 0) step += nbucket;
+    st = ffo;
+    baseW += step;
+    if (step != 0)
+      checkSources();
+  }
+
+  void addOrUpdate(int node, int newdist, int olddist = BaseGraph::RESULT_MAX_VALUE) {
+    if (size == 0) {
+      baseW = newdist/bucketSize;
+    }
+    if (olddist != BaseGraph::RESULT_MAX_VALUE && (olddist/bucketSize < baseW || olddist/bucketSize >= (baseW+nbucket))) return;
+    if (newdist/bucketSize < baseW || newdist/bucketSize >= (baseW+nbucket)) return;
+    int index = node - minIndex;
+    if (olddist == BaseGraph::RESULT_MAX_VALUE) {
+      size++;
+      data[index].next = data[index].prev = -1;
+    } else {
+      // remove from old bucket
+      if (data[index].prev == -1) {
+        int step = olddist/bucketSize - baseW;
+        buckets[(st+step) % nbucket]  = data[index].next;
+        data[data[index].next].prev = -1;
+        if (buckets[(st+step) % nbucket] == -1)
+          unsetMask((st+step) % nbucket);
+      } else {
+        data[data[index].prev].next = data[index].next;
+        data[data[index].next].prev = data[index].prev;
+      }
+    }
+    // add into new bucket
+    int newbucketIdx = (st + newdist/bucketSize - baseW) % nbucket;
+    data[index].next = buckets[newbucketIdx];
+    if (data[index].next != -1)
+      data[data[index].next].prev = index;
+    data[index].prev = -1;
+    buckets[newbucketIdx] = index;
+    setMask(newbucketIdx);
+  }
+
+  void checkSources() {
+    if (sourceIdx < nsource) {
+      if (size == 0) {
+        baseW = sources[sourceIdx].value / bucketSize;
+      }
+      while (sourceIdx < nsource && sources[sourceIdx].value/bucketSize - baseW < nbucket) {
+        addOrUpdate(sources[sourceIdx].key, sources[sourceIdx].value);
+        sourceIdx++;
+      }
+    }
+  }
+};
+
+class SeperateDijk: public Solver<AdjacentMatrix> {
+
+    char name[1024];
+    const int THREAD_NUM, NUM_RELAX_EACH_ITERATION;
+    Heaps *heaps;
+    OMPLockStacks *stacks;
+    const char * SOURCE_SRC;
+    const int *colors, *label, *unlabel;
+  Utils::Item** sNodes;
+    int *shortestArc;
+    SeperateDijkUtils::Syncer *syncer;
+
+    friend class SeperateDijkUtils::Syncer;
+
+  void relax(AdjacentMatrix *matrix, int &totalScan, float& heapOpSec, FILE* fileNode, FILE* fileW,int* nodes, int* ws, int count, Utils::Item* sources, int nsource) {
+        int pid = omp_get_thread_num();
+        CycleTimer heapOpTimer, perfTimer;
+        float perfS;
+
+        // if (pid > 49) return;
+        // if (pid < 47) return;
+        // if (pid != 49) return;
+        int minIndex, maxIndex;
+        int maxW = 0;
+        minIndex = INT_MAX;
+        maxIndex = -1;
+        for (int i = 0; i < matrix->n; i++) {
+          if (colors[i] == pid) {
+            maxIndex = std::max(maxIndex, i);
+            minIndex = std::min(minIndex, i);
+          }
+        }
+        for (int i = minIndex; i <= maxIndex; i++) {
+          assert(colors[i] == pid);
+          for (int j = matrix->g[i]; j < matrix->g[i+1]; j++) {
+            maxW = std::max(maxW, matrix->archArray[j].w);
+          }
+        }
+        printf("pid = %d, maxW = %d, nsource = %d\n", pid, maxW, nsource);
+        ListBucket lb(sources, nsource, maxW, maxIndex, minIndex);
+        //printf("pid = %d, lb.size = %d\n", pid, lb.size);
+        heapOpTimer.Start();
+        AdjacentMatrix::Arch *&archArray = matrix->archArray;
+        int *&g = matrix->g;
+        int *&result = matrix->result;
+        Utils::Item data;
+        int &src_node = data.key, &src_result = data.value;
+        int nodecount = 0;
+        while (nodecount != maxIndex - minIndex + 1) {
+          nodecount++;
+          Utils::Item lbdata;
+          // lb.getTop(lbdata);
+          // heaps->removeTop(pid, &data);
+          lb.getTop(data);
+          if (data.key == -1) continue;
+          // if (result[lbdata.key] != src_result) {
+          //   printf("[NE] pid = %d, nodecount = %d, lbdata.key = %d, v = %d, src_node = %d, src_result = %d, size = %d\n",
+          //          pid, nodecount, lbdata.key,
+          //          result[lbdata.key], src_node, src_result, lb.size);
+          //   // assert(false);
+          // } else {
+          //   printf("[EQ] pid = %d, nodecount = %d, lbdata.key = %d, v = %d, src_node = %d, src_result = %d, size = %d\n",
+          //          pid, nodecount, lbdata.key,
+          //          result[lbdata.key], src_node, src_result, lb.size);
+          // }
+          //if (result[src_node] > src_result) result[src_node] = src_result;
+#ifdef PERF_SCAN
+          ++totalScan;
+#endif
+          for (int i = g[src_node]; i < g[src_node + 1]; ++i) {
+            int &dst_node = archArray[i].j, &weight = archArray[i].w, new_dst_result = result[src_node] + weight;
+            if (colors[dst_node] == pid) {
+              if (result[dst_node] > new_dst_result) {
+                // heaps->addOrUpdate(pid, dst_node, new_dst_result);
+                lb.addOrUpdate(dst_node, new_dst_result, result[dst_node]);
+                result[dst_node] = new_dst_result;
+              }
+            }
+          }
+          lb.removeTop();
+        }
+        heapOpTimer.Stop();
+        heapOpSec += heapOpTimer.GetSecond();
+        printf("pid = %d, perfS = %f, #node = %d\n", pid, perfS, maxIndex - minIndex + 1);
+    }
+
+    void adjust(AdjacentMatrix *matrix) {
+        int pid = omp_get_thread_num();
+        int *&result = matrix->result;
+        Utils::Item data;
+        int &src_node = data.key, &src_result = data.value;
+    }
+
+    void worker(AdjacentMatrix *matrix, int &totalScan, float & heapOpSec, FILE* file,
+                int count, Utils::Item* sources, int nsource) {
+        int pid = omp_get_thread_num();
+        char nodePath[200]; sprintf(nodePath, "Dataset/nodes.%d", pid);
+        char wPath[200]; sprintf(wPath, "Dataset/ws.%d", pid);
+        relax(matrix, totalScan, heapOpSec, NULL, NULL, NULL, NULL, count, sources, nsource);
+    }
+
+public:
+ SeperateDijk(int thread_num, const char * SOURCE_SRC, int num_relax_each_iteration) :
+    THREAD_NUM(thread_num), SOURCE_SRC(SOURCE_SRC), NUM_RELAX_EACH_ITERATION(num_relax_each_iteration), heaps(NULL), stacks(NULL), colors(NULL), label(NULL), unlabel(NULL), syncer(NULL) {
+        sprintf(name, "Dijstra + Adjustment + GlobalHeapStack: THREAD_NUM=%d, NUM_RELAX_EACH_ITERATION=%d", THREAD_NUM, NUM_RELAX_EACH_ITERATION);
+    }
+
+    const char * getName() {
+        return name;
+    }
+
+    void compute(AdjacentMatrix &adjMatrix, Colors *colors, int source, double &prepareTimeS, double &runningTimeS, double &totalScan, double &avgScan) {
+        omp_set_num_threads(THREAD_NUM);
+
+        CycleTimer prepareTimer, runningTimer;
+#ifdef PERF_SCAN
+        totalScan = 0;
+#endif
+
+        // Step 1: prepare Environment
+        prepareTimer.Start();
+
+        int &n = adjMatrix.n;
+        this->colors = colors->getColors();
+        this->label = colors->getlabel();
+        this->unlabel = colors->getunlabel();
+
+        int *&result = adjMatrix.result;
+        adjMatrix.resetResult();
+
+
+        /*
+         * create heaps and stacks for each thread
+         */
+        heaps = new Heaps(n, THREAD_NUM, colors->getNodeNumberCount());
+        stacks = new OMPLockStacks(n, THREAD_NUM, colors->getNodeNumberCount(), label);
+
+        /**
+         * create and init shortestArc for each node
+         **/
+        AdjacentMatrix::Arch *&archArray = adjMatrix.archArray;
+        int *&g = adjMatrix.g;
+        adjMatrix.buildSimple();
+        shortestArc = new int[n];
+        for (int i = 0; i < n; i++) {
+          int result = INT_MAX;
+          for (int j = g[i]; j < g[i + 1]; j++) {
+            int &dst_node = archArray[j].j, &weight = archArray[j].w;
+            if (weight < result) result = weight;
+          }
+          shortestArc[i] = result;
+        }
+
+        /*
+         * create syncer
+         */
+        syncer = new SeperateDijkUtils::Syncer(THREAD_NUM);
+        FILE* file = fopen(SOURCE_SRC, "rb");
+        if (file == NULL) {
+          perror("file fopen");
+        }
+        size_t nnode;
+        fread(&nnode, sizeof(size_t), 1, file);
+        std::vector<std::vector<int> > sourceNodes;
+        std::vector<std::vector<int> > sourceNodesValue;
+        sourceNodes.resize(THREAD_NUM);
+        sourceNodesValue.resize(THREAD_NUM);
+        for (int i = 0; i < nnode; i++) {
+          int node, val;
+          fread(&node, sizeof(int), 1, file);
+          fread(&val, sizeof(int), 1, file);
+          heaps->addOrUpdate(this->colors[node], node, val);
+          result[node] = val;
+          sourceNodes[this->colors[node]].push_back(node);
+          sourceNodesValue[this->colors[node]].push_back(val);
+        }
+        fclose(file);
+        sNodes = new Utils::Item*[THREAD_NUM];
+        for (int i = 0; i < THREAD_NUM; i++) {
+          sNodes[i] = (Utils::Item*)memalign(256, sizeof(Utils::Item)*sourceNodes[i].size());
+          for (int j = 0; j < sourceNodes[i].size(); j++) {
+            sNodes[i][j].key = sourceNodes[i][j];
+            sNodes[i][j].value = sourceNodesValue[i][j];
+          }
+        }
+        prepareTimer.Stop();
+
+        // Step 2: start to compute
+        runningTimer.Start();
+
+        result[source] = 0;
+        heaps->addOrUpdate(this->colors[source], source, 0);
+
+#pragma omp parallel
+        {
+            int ts = 0;
+            CycleTimer threadTimer, fileTimer;
+            float heapOpSec = 0;
+            int pid = omp_get_thread_num();
+            /* int fd = open(filename, O_RDONLY); */
+            /* assert(fd != -1); if (fd == -1) perror("open"); */
+            /* queue = (Utils::Item*)mmap(NULL, sizeof(Utils::Item)*colors->getNodeNumberCount()[pid], */
+            /*                            PROT_READ, MAP_ANONYMOUS | MAP_PRIVATE, fd, 0); */
+            /* if (queue == MAP_FAILED) perror("mmap"); */
+            /*  assert(queue != MAP_FAILED); */
+
+            threadTimer.Start();
+            worker(&adjMatrix, ts, heapOpSec, NULL, colors->getNodeNumberCount()[pid], sNodes[pid], sourceNodes[pid].size());
+            threadTimer.Stop();
+            printf("pid = %d, sec = %lf, file sec = %lf, # of nodes = %d\n", pid, threadTimer.GetSecond(), heapOpSec,
+                   colors->getNodeNumberCount()[pid]);
+#ifdef PERF_SCAN
+#pragma omp atomic
+            totalScan += ts;
+#endif
+        }
+
+        runningTimer.Stop();
+        int nunreached = 0;
+        for (int i = 0; i < n; i++) {
+          if (adjMatrix.result[i] == BaseGraph::RESULT_MAX_VALUE) {
+            nunreached++;
+          }
+        }
+        printf("nunreached = %d\n", nunreached);
+        // Step 3: destroy environment
+        prepareTimer.Start();
+
+        delete syncer;
+
+        /*
+         * destroy heaps and stacks for each thread
+         */
+        delete stacks;
+        delete heaps;
+
+        prepareTimer.Stop();
+
+        runningTimeS = runningTimer.GetSecond();
+        prepareTimeS = prepareTimer.GetSecond();
+#ifdef PERF_SCAN
+        avgScan = totalScan / THREAD_NUM;
+#endif
+    }
+};
+
+namespace SeperateDijkUtils {
+
+    inline void Syncer::set(int p) {
+        if (!marker[p]) ++counter;
+        marker[p] = true;
+    }
+
+    inline void Syncer::unset(int p) {
+        if (marker[p]) --counter;
+        marker[p] = false;
+    }
+
+    Syncer::Syncer(int n) :
+            counter(0), N(n) {
+        omp_init_lock(&lock);
+        marker = (bool*) malloc(n * sizeof(bool));
+        memset(marker, 0, sizeof(bool) * n);
+    }
+
+    inline void Syncer::setSafe(int p, SeperateDijk * const solver) {
+        if (marker[p]) return;
+        omp_set_lock(&lock);
+        if (solver->heaps->empty(p) && solver->stacks->empty(p)) set(p);
+        omp_unset_lock(&lock);
+    }
+
+    inline void Syncer::unsetSafe(int p) {
+        if (!marker[p]) return;
+        omp_set_lock(&lock);
+        unset(p);
+        omp_unset_lock(&lock);
+    }
+
+    bool Syncer::ready(int p) {
+        return marker[p];
+    }
+
+    bool Syncer::ready() {
+        return counter == N;
+    }
+
+    Syncer::~Syncer() {
+        free(marker);
+        omp_destroy_lock(&lock);
+    }
+
+}
+
+#endif

@@ -1,0 +1,135 @@
+#ifndef LINKLIST_TEST_H_
+#define LINKLIST_TEST_H_
+
+#include <omp.h>
+#include "../Utils/ColorUtils.h"
+
+
+class LinkListTest: public Solver<AdjacentMatrix, BufferSizePerThread> {
+
+    char name[1024];
+    const int THREAD_NUM, NUM_RELAX_EACH_ITERATION;
+
+    const int *colors, *label, *unlabel;
+
+    void worker() {
+      int pid = omp_get_thread_num();
+      int buf[BufferSizePerThread];
+      int i = 0;
+      while (i < 1024*1024*1024) {
+        buf[i%BufferSizePerThread] = i;
+        i++;
+      }
+    }
+
+public:
+    LinkListTest(int thread_num, int num_relax_each_iteration) :
+    THREAD_NUM(thread_num), NUM_RELAX_EACH_ITERATION(num_relax_each_iteration) {
+      sprintf(name, "LinkListTest: THREAD_NUM=%d, NUM_RELAX_EACH_ITERATION=%d", THREAD_NUM, NUM_RELAX_EACH_ITERATION);
+    }
+
+    const char * getName() {
+        return name;
+    }
+
+    void compute(AdjacentMatrix &adjMatrix, Colors *colors, int source, double &prepareTimeS, double &runningTimeS, double &totalScan, double &avgScan) {
+        omp_set_num_threads(THREAD_NUM);
+
+        CycleTimer prepareTimer, runningTimer;
+#ifdef PERF_SCAN
+        totalScan = 0;
+#endif
+
+        // Step 1: prepare Environment
+        prepareTimer.Start();
+
+        int &n = adjMatrix.n;
+        this->colors = colors->getColors();
+        this->label = colors->getlabel();
+        this->unlabel = colors->getunlabel();
+
+        int *&result = adjMatrix.result;
+        adjMatrix.resetResult();
+
+        prepareTimer.Stop();
+
+        // Step 2: start to compute
+        runningTimer.Start();
+
+#pragma omp parallel
+        {
+          worker();
+        }
+
+        runningTimer.Stop();
+
+        // Step 3: destroy environment
+        prepareTimer.Start();
+
+        delete syncer;
+
+        /*
+         * destroy heaps and stacks for each thread
+         */
+        delete stacks;
+        delete heaps;
+
+        prepareTimer.Stop();
+
+        runningTimeS = runningTimer.GetSecond();
+        prepareTimeS = prepareTimer.GetSecond();
+#ifdef PERF_SCAN
+        avgScan = totalScan / THREAD_NUM;
+#endif
+    }
+};
+
+namespace AdjustDijGlobalHeapStacksUtils {
+
+    inline void Syncer::set(int p) {
+        if (!marker[p]) ++counter;
+        marker[p] = true;
+    }
+
+    inline void Syncer::unset(int p) {
+        if (marker[p]) --counter;
+        marker[p] = false;
+    }
+
+    Syncer::Syncer(int n) :
+            counter(0), N(n) {
+        omp_init_lock(&lock);
+        marker = (bool*) malloc(n * sizeof(bool));
+        memset(marker, 0, sizeof(bool) * n);
+    }
+
+    inline void Syncer::setSafe(int p, AdjustDij_GlobalHeapStack * const solver) {
+        if (marker[p]) return;
+        omp_set_lock(&lock);
+        if (solver->heaps->empty(p) && solver->stacks->empty(p)) set(p);
+        omp_unset_lock(&lock);
+    }
+
+    inline void Syncer::unsetSafe(int p) {
+        if (!marker[p]) return;
+        omp_set_lock(&lock);
+        unset(p);
+        omp_unset_lock(&lock);
+    }
+
+    bool Syncer::ready(int p) {
+        return marker[p];
+    }
+
+    bool Syncer::ready() {
+        return counter == N;
+    }
+
+    Syncer::~Syncer() {
+        free(marker);
+        omp_destroy_lock(&lock);
+    }
+
+}
+
+#endif

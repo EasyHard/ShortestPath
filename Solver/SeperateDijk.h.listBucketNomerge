@@ -1,0 +1,334 @@
+#ifndef SPERATEDIJK_H_
+#define SPERATEDIJK_H_
+#include <sys/types.h>
+#include <sys/stat.h>
+#include <stdlib.h>
+#include <malloc.h>
+#include <fcntl.h>
+#include <sys/mman.h>
+#include <immintrin.h>
+#include <omp.h>
+#include "../Utils/ColorUtils.h"
+
+class SeperateDijk;
+
+namespace SeperateDijkUtils {
+    class Syncer {
+        omp_lock_t lock;
+        bool *marker;
+        int counter;
+        const int N;
+
+        inline void set(int p);
+
+        inline void unset(int p);
+
+    public:
+        Syncer(int n);
+
+        inline void setSafe(int p, SeperateDijk * const solver);
+
+        inline void unsetSafe(int p);
+
+        bool ready(int p);
+
+        bool ready();
+
+        ~Syncer();
+    };
+}
+
+using Utils::Heaps;
+using Utils::OMPLockStacks;
+
+#include <climits>
+class SeperateDijk: public Solver<AdjacentMatrix> {
+
+    char name[1024];
+    const int THREAD_NUM, NUM_RELAX_EACH_ITERATION;
+    Heaps *heaps;
+    OMPLockStacks *stacks;
+    const char * SOURCE_SRC;
+    const int *colors, *label, *unlabel;
+  int* idxs;
+    int *shortestArc;
+    SeperateDijkUtils::Syncer *syncer;
+
+    friend class SeperateDijkUtils::Syncer;
+
+    void relax(AdjacentMatrix *matrix, int &totalScan, float& heapOpSec, FILE* fileNode, FILE* fileW,int* nodes, int* ws, int count, int currColor) {
+        int pid = omp_get_thread_num();
+        CycleTimer heapOpTimer, perfTimer;
+        float perfS;
+        heapOpTimer.Start();
+        AdjacentMatrix::Arch *&archArray = matrix->archArray;
+        int *&g = matrix->g;
+        int *&result = matrix->result;
+        Utils::Item data;
+        int &src_node = data.key, &src_result = data.value;
+
+#ifdef IS_MIC
+        int curr = 0;
+        __m512i allones = _mm512_set1_epi32(1);
+
+        while (curr + 16 < count) {
+          __m512i node16 = _mm512_load_epi32(nodes+curr);
+          __m512i w16 = _mm512_i32gather_epi32(node16, result, 4);
+          __m512i edgeIdx = _mm512_i32gather_epi32(node16, g, 4);
+
+          for (int i = 0; i < 3; i++) {
+            __m512i to16 = _mm512_i32gather_epi32(edgeIdx, matrix->tos, 4);
+            __m512i ew16 = _mm512_i32gather_epi32(edgeIdx, matrix->ws, 4);
+            __m512i nw16 = _mm512_add_epi32(w16, ew16);
+            __m512i cw16 = _mm512_i32gather_epi32(to16, result, 4);
+            __mmask16 mask = _mm512_cmplt_epi32_mask(nw16, cw16);
+            __m512i minw16 = _mm512_min_epi32(nw16, cw16);
+            _mm512_mask_i32scatter_epi32(result, mask, to16, minw16, 4);
+            edgeIdx = _mm512_add_epi32(edgeIdx, allones);
+          }
+          curr += 16;
+        }
+#endif
+        heapOpTimer.Stop();
+        heapOpSec += heapOpTimer.GetSecond();
+    }
+
+    void adjust(AdjacentMatrix *matrix) {
+        int pid = omp_get_thread_num();
+        int *&result = matrix->result;
+        Utils::Item data;
+        int &src_node = data.key, &src_result = data.value;
+    }
+
+    void worker(AdjacentMatrix *matrix, int &totalScan, float & heapOpSec, FILE* file,
+                int count, int currColor) {
+        int pid = omp_get_thread_num();
+
+        char nodePath[200]; sprintf(nodePath, "Dataset/nodes.%d", currColor);
+        char wPath[200]; sprintf(wPath, "Dataset/ws.%d", currColor);
+        const char* mode = "r";
+        FILE* fileNode = fopen(nodePath, mode);
+        FILE* fileW = fopen(wPath, mode);
+        int* nodes = (int*)memalign(256, sizeof(int) * count);
+        fread(nodes, sizeof(int), count, fileNode);
+        fclose(fileNode);
+        fclose(fileW);
+        relax(matrix, totalScan, heapOpSec, NULL, NULL, nodes, NULL, count, currColor);
+        free(nodes);
+        //heaps->printStats(pid);
+    }
+
+public:
+ SeperateDijk(int thread_num, const char * SOURCE_SRC, int num_relax_each_iteration) :
+    THREAD_NUM(thread_num), SOURCE_SRC(SOURCE_SRC), NUM_RELAX_EACH_ITERATION(num_relax_each_iteration), heaps(NULL), stacks(NULL), colors(NULL), label(NULL), unlabel(NULL), syncer(NULL) {
+        sprintf(name, "Dijstra + Adjustment + GlobalHeapStack: THREAD_NUM=%d, NUM_RELAX_EACH_ITERATION=%d", THREAD_NUM, NUM_RELAX_EACH_ITERATION);
+    }
+
+    const char * getName() {
+        return name;
+    }
+
+    void compute(AdjacentMatrix &adjMatrix, Colors *colors, int source, double &prepareTimeS, double &runningTimeS, double &totalScan, double &avgScan) {
+        omp_set_num_threads(THREAD_NUM);
+
+        CycleTimer prepareTimer, runningTimer;
+#ifdef PERF_SCAN
+        totalScan = 0;
+#endif
+
+        // Step 1: prepare Environment
+        prepareTimer.Start();
+
+        int &n = adjMatrix.n;
+        this->colors = colors->getColors();
+        this->label = colors->getlabel();
+        this->unlabel = colors->getunlabel();
+
+        int *&result = adjMatrix.result;
+        adjMatrix.resetResult();
+
+        /*
+         * create heaps and stacks for each thread
+         */
+        heaps = new Heaps(n, colors->threadNum, colors->getNodeNumberCount());
+
+        /**
+         * create and init shortestArc for each node
+         **/
+        AdjacentMatrix::Arch *&archArray = adjMatrix.archArray;
+        int *&g = adjMatrix.g;
+        adjMatrix.buildSimple();
+        shortestArc = new int[n];
+        for (int i = 0; i < n; i++) {
+          int result = INT_MAX;
+          for (int j = g[i]; j < g[i + 1]; j++) {
+            int &dst_node = archArray[j].j, &weight = archArray[j].w;
+            if (weight < result) result = weight;
+          }
+          shortestArc[i] = result;
+        }
+        printf("start to init heap data\n");
+        FILE* file = fopen(SOURCE_SRC, "rb");
+        if (file == NULL) {
+          perror("file fopen");
+        }
+        size_t nnode;
+        fread(&nnode, sizeof(size_t), 1, file);
+        for (int i = 0; i < nnode; i++) {
+          int node, val;
+          fread(&node, sizeof(int), 1, file);
+          fread(&val, sizeof(int), 1, file);
+          heaps->addOrUpdate(this->colors[node], node, val);
+          result[node] = val;
+        }
+        fclose(file);
+        prepareTimer.Stop();
+
+        // Step 2: start to compute
+        runningTimer.Start();
+
+        result[source] = 0;
+        heaps->addOrUpdate(this->colors[source], source, 0);
+        printf("inited heaps\n");
+        idxs = new int[colors->threadNum];
+        int totLen = 0;
+        for (int i = 0; i < colors->threadNum; i++) {
+          idxs[i] = totLen;
+          totLen += (colors->getNodeNumberCount()[i] + 255) /256 * 256;
+        }
+        int *nodes = (int*)memalign(256, sizeof(int) * totLen);
+        int *ws = (int*)memalign(256, sizeof(int) * totLen);
+        for (int i = 0; i < colors->threadNum; i++) {
+          char nodePath[200]; sprintf(nodePath, "Dataset/nodes.%d", i);
+          char wPath[200]; sprintf(wPath, "Dataset/ws.%d", i);
+          const char* mode = "r";
+          FILE* fileNode = fopen(nodePath, mode);
+          FILE* fileW = fopen(wPath, mode);
+          fread(nodes+idxs[i], sizeof(int), colors->getNodeNumberCount()[i], fileNode);
+          fread(ws+idxs[i], sizeof(int), colors->getNodeNumberCount()[i], fileW);
+          fclose(fileNode);
+          fclose(fileW);
+        }
+
+        int minIndex[colors->threadNum], maxIndex[colors->threadNum];
+        for (int i = 0; i < colors->threadNum; i++) {
+          minIndex[i] = INT_MAX; maxIndex[i] = -1;
+        }
+        for (int i = 0; i < adjMatrix.n; i++) {
+          maxIndex[this->colors[i]] = std::max(maxIndex[this->colors[i]], i);
+          minIndex[this->colors[i]] = std::min(minIndex[this->colors[i]], i);
+        }
+#pragma omp parallel
+        {
+            int ts = 0;
+            CycleTimer threadTimer, fileTimer;
+            float heapOpSec = 0;
+            int pid = omp_get_thread_num();
+            Utils::Item *queue = NULL;
+            /* int fd = open(filename, O_RDONLY); */
+            /* assert(fd != -1); if (fd == -1) perror("open"); */
+            /* queue = (Utils::Item*)mmap(NULL, sizeof(Utils::Item)*colors->getNodeNumberCount()[pid], */
+            /*                            PROT_READ, MAP_ANONYMOUS | MAP_PRIVATE, fd, 0); */
+            /* if (queue == MAP_FAILED) perror("mmap"); */
+            /*  assert(queue != MAP_FAILED); */
+
+            threadTimer.Start();
+            int currColor = pid;
+            while (currColor < colors->threadNum) {
+              int sum = 0;
+              for (int i = 0; i < colors->getNodeNumberCount()[currColor]; i++) {
+                sum += *(nodes + idxs[currColor] + i) + *(ws + idxs[currColor] + i);
+                int node = *(nodes + idxs[currColor] + i);
+                for (int j = adjMatrix.g[node]; j < adjMatrix.g[node+1]; j++) {
+                  sum += adjMatrix.tos[j] + adjMatrix.ws[j];
+                }
+              }
+              printf("sum = %d\n", sum);
+              relax(&adjMatrix, ts, heapOpSec, NULL, NULL, nodes + idxs[currColor], NULL, colors->getNodeNumberCount()[currColor], currColor);
+              currColor += THREAD_NUM;
+            }
+            threadTimer.Stop();
+            printf("pid = %d, sec = %lf, file sec = %lf, # of nodes = %d\n", pid, threadTimer.GetSecond(), heapOpSec,
+                   colors->getNodeNumberCount()[pid]);
+#ifdef PERF_SCAN
+#pragma omp atomic
+            totalScan += ts;
+#endif
+        }
+
+        runningTimer.Stop();
+        int nunreached = 0;
+        for (int i = 0; i < n; i++) {
+          if (adjMatrix.result[i] == BaseGraph::RESULT_MAX_VALUE) {
+            nunreached++;
+          }
+        }
+        printf("nunreached = %d\n", nunreached);
+        // Step 3: destroy environment
+        prepareTimer.Start();
+
+
+        /*
+         * destroy heaps and stacks for each thread
+         */
+        delete heaps;
+
+        prepareTimer.Stop();
+
+        runningTimeS = runningTimer.GetSecond();
+        prepareTimeS = prepareTimer.GetSecond();
+#ifdef PERF_SCAN
+        avgScan = totalScan / THREAD_NUM;
+#endif
+    }
+};
+
+namespace SeperateDijkUtils {
+
+    inline void Syncer::set(int p) {
+        if (!marker[p]) ++counter;
+        marker[p] = true;
+    }
+
+    inline void Syncer::unset(int p) {
+        if (marker[p]) --counter;
+        marker[p] = false;
+    }
+
+    Syncer::Syncer(int n) :
+            counter(0), N(n) {
+        omp_init_lock(&lock);
+        marker = (bool*) malloc(n * sizeof(bool));
+        memset(marker, 0, sizeof(bool) * n);
+    }
+
+    inline void Syncer::setSafe(int p, SeperateDijk * const solver) {
+        if (marker[p]) return;
+        omp_set_lock(&lock);
+        if (solver->heaps->empty(p) && solver->stacks->empty(p)) set(p);
+        omp_unset_lock(&lock);
+    }
+
+    inline void Syncer::unsetSafe(int p) {
+        if (!marker[p]) return;
+        omp_set_lock(&lock);
+        unset(p);
+        omp_unset_lock(&lock);
+    }
+
+    bool Syncer::ready(int p) {
+        return marker[p];
+    }
+
+    bool Syncer::ready() {
+        return counter == N;
+    }
+
+    Syncer::~Syncer() {
+        free(marker);
+        omp_destroy_lock(&lock);
+    }
+
+}
+
+#endif
